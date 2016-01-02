@@ -35,6 +35,7 @@ package diskpacked
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"errors"
 	"expvar"
 	"fmt"
@@ -46,6 +47,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"camlistore.org/pkg/blob"
 	"camlistore.org/pkg/blobserver"
@@ -59,6 +61,19 @@ import (
 	"go4.org/strutil"
 	"go4.org/syncutil"
 )
+
+type superBlock struct {
+	Start int64  `json:"start"`
+	Size  int64  `json:"size"`
+	Pos   int64  `json:"pos"`
+	Ts    string `json:"timeStamp"`
+	// TODO add a checksum (or just use signature here to
+	// prevent accidentally modification of super block
+	// also a backup super block is needed
+}
+
+const magic = "CAML\nhttps://camlistore.org/doc/block\n"
+const minDevSize = 1024 * 1024 * 10 // block devie minimum size 10M bytes
 
 // TODO(wathiede): replace with glog.V(2) when we decide our logging story.
 type debugT bool
@@ -81,9 +96,11 @@ const defaultMaxFileSize = 512 << 20 // 512MB
 
 type storage struct {
 	root        string
+	isRawBlkDev bool
 	index       sorted.KeyValue
 	maxFileSize int64
 
+	sb        superBlock
 	writeLock io.Closer // Provided by lock.Lock, and guards other processes from accesing the file open for writes.
 
 	*local.Generationer
@@ -111,6 +128,8 @@ const defaultIndexType = sorted.DefaultKVFileType
 const defaultIndexFile = "index." + defaultIndexType
 
 // IsDir reports whether dir is a diskpacked directory.
+// if root is a block device, err will be returned. It makes sense because
+// without a metaIndex a new Storage can't be created.
 func IsDir(dir string) (bool, error) {
 	_, err := os.Stat(filepath.Join(dir, defaultIndexFile))
 	if os.IsNotExist(err) {
@@ -145,6 +164,7 @@ func newIndex(root string, indexConf jsonconfig.Obj) (sorted.KeyValue, error) {
 // newStorage returns a new storage in path root with the given maxFileSize,
 // or defaultMaxFileSize (512MB) if <= 0
 func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *storage, err error) {
+	var isRawBlkDev = false
 	fi, err := os.Stat(root)
 	if os.IsNotExist(err) {
 		return nil, fmt.Errorf("storage root %q doesn't exist", root)
@@ -152,9 +172,15 @@ func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *st
 	if err != nil {
 		return nil, fmt.Errorf("Failed to stat directory %q: %v", root, err)
 	}
-	if !fi.IsDir() {
+	if (fi.Mode()&os.ModeDevice) != 0 && (fi.Mode()&os.ModeCharDevice) == 0 { // block device
+		if indexConf == nil {
+			return nil, fmt.Errorf("Can't create new storage on block device without metaIndex path")
+		}
+		isRawBlkDev = true
+	} else if !fi.IsDir() {
 		return nil, fmt.Errorf("storage root %q exists but is not a directory.", root)
 	}
+
 	index, err := newIndex(root, indexConf)
 	if err != nil {
 		return nil, err
@@ -171,16 +197,28 @@ func newStorage(root string, maxFileSize int64, indexConf jsonconfig.Obj) (s *st
 	// reads/writes consistent across diskpacked targets, regardless of what
 	// people put in their low level config.
 	root = strings.TrimRight(root, `\/`)
+	genRoot := root
+	if isRawBlkDev {
+		indexFile, _ := index.Get("file")
+		genRoot = filepath.Dir(indexFile)
+	}
 	s = &storage{
 		root:         root,
+		isRawBlkDev:  isRawBlkDev,
 		index:        index,
 		maxFileSize:  maxFileSize,
-		Generationer: local.NewGenerationer(root),
+		Generationer: local.NewGenerationer(genRoot),
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.openAllPacks(); err != nil {
-		return nil, err
+	if isRawBlkDev {
+		if err := s.openBlockDevice(); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := s.openAllPacks(); err != nil {
+			return nil, err
+		}
 	}
 	if _, _, err := s.StorageGeneration(); err != nil {
 		return nil, fmt.Errorf("Error initialization generation for %q: %v", root, err)
@@ -306,6 +344,108 @@ func (s *storage) openAllPacks() error {
 	return s.openForWrite(n - 1)
 }
 
+func (s *storage) updateSuperBlock() error {
+	if _, err := s.writer.Seek(int64(len(magic)), 0); err != nil {
+		return err
+	}
+
+	s.sb.Ts = time.Now().Format(time.Stamp)
+	buf, err := json.Marshal(s.sb)
+	if err != nil {
+		return err
+	}
+	var filler = make([]byte, 512-len(magic)-len(buf))
+	for k, _ := range filler {
+		filler[k] = byte('\n')
+	}
+	buf = append(buf, filler...)
+
+	if _, err = s.writer.Write(buf); err != nil {
+		return err
+	}
+
+	return nil
+
+}
+
+func (s *storage) recreateSuperBlock() error {
+	if _, err := s.writer.Seek(0, 0); err != nil {
+		return err
+	}
+	if _, err := s.writer.Write([]byte(magic)); err != nil {
+		return err
+	}
+	s.sb.Start = 512
+	s.sb.Pos = 512
+	s.sb.Ts = time.Now().Format(time.Stamp)
+
+	return s.updateSuperBlock()
+}
+
+func (s *storage) readSuperBlock() error {
+	if _, err := s.fds[0].Seek(int64(len(magic)), 0); err != nil {
+		return err
+	}
+	var buf = make([]byte, 512-len(magic))
+	if _, err := io.ReadFull(s.fds[0], buf); err != nil {
+		log.Printf("diskpacked: Can't read super block: %s", err)
+		//TODO read backup super block if it exists, and overwrite main
+		return err
+	}
+
+	if err := json.Unmarshal(buf, &s.sb); err != nil {
+		//TODO read backup super block if it exists, and overwrite main
+		log.Println("error parsing superblock")
+		return err
+	}
+	return nil
+}
+
+// this function is equivalent to openAllPacks for raw block device
+// This function is not thread safe, s.mu should be locked by the caller.
+func (s *storage) openBlockDevice() error {
+	// Open device for write first, because recreateSuperBlock may write to it.
+	fw, err := os.OpenFile(s.root, os.O_RDWR, 0666)
+	if err != nil {
+		return err
+	}
+	s.writer = fw
+	s.writeLock = ioutil.NopCloser(nil)
+
+	openFdsVar.Add(s.root, 1)
+	debug.Printf("diskpacked: opened for write %q", fw)
+
+	f, err := os.Open(s.root)
+	if err != nil {
+		fw.Close()
+		return err
+	}
+
+	l, err := f.Seek(0, os.SEEK_END)
+	if err != nil {
+		fw.Close()
+		return err
+	}
+	if l < minDevSize {
+		return fmt.Errorf("diskpacked: block device %s size has to be at least 10M bytes", s.root)
+	}
+	s.fds = append(s.fds, f)
+	s.sb.Size = l
+	if err = s.readSuperBlock(); err != nil {
+		log.Println("recreating superblock")
+		// There is no need to call s.writer.Sync() here, because it'll be called when
+		// append is called; if no append is called, next time just create a fresh new
+		// super block if this super block is not written to disk automatically
+		if err = s.recreateSuperBlock(); err != nil {
+			fw.Close()
+			f.Close()
+			return err
+		}
+	}
+
+	return nil
+}
+
 func (s *storage) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -400,15 +540,17 @@ func (s *storage) RemoveBlobs(blobs []blob.Ref) error {
 	var wg syncutil.Group
 	for _, br := range blobs {
 		br := br
-		removeGate.Start()
 		batch.Delete(br.String())
-		wg.Go(func() error {
-			defer removeGate.Done()
-			if err := s.delete(br); err != nil {
-				return err
-			}
-			return nil
-		})
+		if !s.isRawBlkDev {
+			removeGate.Start()
+			wg.Go(func() error {
+				defer removeGate.Done()
+				if err := s.delete(br); err != nil {
+					return err
+				}
+				return nil
+			})
+		}
 	}
 	err1 := wg.Err()
 	err2 := s.index.CommitBatch(batch)
@@ -538,7 +680,12 @@ func (s *storage) StreamBlobs(ctx context.Context, dest chan<- blobserver.BlobAn
 	debug.Printf("Continuing blob streaming from pack %s, offset %d",
 		s.filename(fileNum), offset)
 
-	fd, err := os.Open(s.filename(fileNum))
+	var fd *os.File
+	if s.isRawBlkDev {
+		fd, err = os.Open(s.root)
+	} else {
+		fd, err = os.Open(s.filename(fileNum))
+	}
 	if err != nil {
 		return err
 	}
@@ -567,24 +714,29 @@ func (s *storage) StreamBlobs(ctx context.Context, dest chan<- blobserver.BlobAn
 	r := bufio.NewReaderSize(fd, ioBufSize)
 
 	for {
-		//  Are we at the EOF of this pack?
-		if _, err := r.Peek(1); err != nil {
-			if err != io.EOF {
-				return err
-			}
-			// EOF case; continue to the next pack, if any.
-			fileNum += 1
-			offset = 0
-			fd.Close() // Close the previous pack
-			fd, err = os.Open(s.filename(fileNum))
-			if os.IsNotExist(err) {
-				// We reached the end.
+		if s.isRawBlkDev {
+			if offset >= s.sb.Pos { // we reached the end
 				return nil
-			} else if err != nil {
-				return err
 			}
-			r.Reset(fd)
-			continue
+		} else {
+			if _, err := r.Peek(1); err != nil {
+				if err != io.EOF {
+					return err
+				}
+				// EOF case; continue to the next pack, if any.
+				fileNum += 1
+				offset = 0
+				fd.Close() // Close the previous pack
+				fd, err = os.Open(s.filename(fileNum))
+				if os.IsNotExist(err) {
+					// We reached the end.
+					return nil
+				} else if err != nil {
+					return err
+				}
+				r.Reset(fd)
+				continue
+			}
 		}
 
 		thisOffset := offset // of current blob's header
@@ -648,14 +800,72 @@ func (s *storage) ReceiveBlob(br blob.Ref, source io.Reader) (sbr blob.SizedRef,
 	// Check if it's a dup. Still accept it if the pack file on disk seems to be corrupt
 	// or truncated.
 	if m, err := s.meta(br); err == nil {
-		fi, err := os.Stat(s.filename(m.file))
-		if err == nil && fi.Size() >= m.offset+int64(m.size) {
+		if s.isRawBlkDev {
 			return sbr, nil
+		} else {
+			fi, err := os.Stat(s.filename(m.file))
+			if err == nil && fi.Size() >= m.offset+int64(m.size) {
+				return sbr, nil
+			}
 		}
 	}
 
-	err = s.append(sbr, &b)
+	if s.isRawBlkDev {
+		err = s.appendBlock(sbr, &b)
+	} else {
+		err = s.append(sbr, &b)
+	}
 	return
+}
+
+// appendBlock writes the provided blob to the current block device.
+func (s *storage) appendBlock(br blob.SizedRef, r io.Reader) (err error) {
+	s.mu.Lock()
+	// to be able to undo the append
+	origPos := s.sb.Pos
+	defer func() {
+		if err != nil {
+			s.sb.Pos = origPos
+		}
+		s.mu.Unlock()
+	}()
+	if s.closed {
+		return errors.New("diskpacked: write to closed storage")
+	}
+
+	if _, err = s.writer.Seek(origPos, os.SEEK_SET); err != nil {
+		return err
+	}
+	fn := s.writer.Name()
+	n, err := fmt.Fprintf(s.writer, "[%v %v]", br.Ref.String(), br.Size)
+	s.sb.Pos += int64(n)
+	writeVar.Add(fn, int64(n))
+	writeTotVar.Add(s.root, int64(n))
+	if err != nil {
+		return err
+	}
+
+	offset := s.sb.Pos
+
+	n2, err := io.Copy(s.writer, r)
+	s.sb.Pos += n2
+	writeVar.Add(fn, int64(n))
+	writeTotVar.Add(s.root, int64(n))
+	if err != nil {
+		return err
+	}
+	if n2 != int64(br.Size) {
+		return fmt.Errorf("diskpacked: written blob size %d didn't match size %d", n, br.Size)
+	}
+	if err = s.updateSuperBlock(); err != nil {
+		return err
+	}
+	if err = s.writer.Sync(); err != nil {
+		return err
+	}
+
+	err = s.index.Set(br.Ref.String(), blobMeta{0, offset, br.Size}.String())
+	return err
 }
 
 // append writes the provided blob to the current data file.

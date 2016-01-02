@@ -14,6 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+/*
+In order to run tests against block device, you should set environment
+variable CAMLI_DP_DEVICE, and make sure the user running the tests has
+write permission to the device.
+
+If there is no block device available, you can also setup loopback by:
+"losetup /dev/loopX testdata/sparse.img"
+and provide /dev/loopX to CAMLI_DP_DEVICE, the sparse.img file can be
+generated like this:
+"dd if=/dev/zero of=testdata/sparse.img bs=4M count=0 seek=1000"
+*/
+
 package diskpacked
 
 import (
@@ -35,21 +47,62 @@ import (
 )
 
 func newTempDiskpacked(t *testing.T) (sto blobserver.Storage, cleanup func()) {
-	return newTempDiskpackedWithIndex(t, jsonconfig.Obj{})
+	return newTempDiskpackedWithIndex(t, jsonconfig.Obj{}, "")
 }
 
 func newTempDiskpackedMemory(t *testing.T) (sto blobserver.Storage, cleanup func()) {
 	return newTempDiskpackedWithIndex(t, jsonconfig.Obj{
 		"type": "memory",
-	})
+	}, "")
 }
 
-func newTempDiskpackedWithIndex(t *testing.T, indexConf jsonconfig.Obj) (sto blobserver.Storage, cleanup func()) {
-	restoreLogging := test.TLog(t)
-	dir, err := ioutil.TempDir("", "diskpacked-test")
-	if err != nil {
-		t.Fatal(err)
+func newTempDiskpackedBlock(t *testing.T) (sto blobserver.Storage, cleanup func()) {
+	blockDevice := os.Getenv("CAMLI_DP_DEVICE")
+	if blockDevice == "" {
+		t.Skip("No loopback device given (CAMLI_DP_DEVICE)")
+		return nil, nil
+	} else {
+		/*
+			var out bytes.Buffer
+			cmd := exec.Command("cp", "testdata/sparse.img", "testdata/tmp.img")
+			cmd.Stderr = &out
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("cp failed: %s", out.String())
+				return
+			}
+			cmd = exec.Command("/sbin/losetup", blockDevice, "testdata/tmp.img")
+			cmd.Stderr = &out
+			if err := cmd.Run(); err != nil {
+				t.Fatalf("mounting loopback device %s failed: %s", blockDevice, out.String())
+				return
+			}
+			defer func() {
+				cmd = exec.Command("/sbin/losetup", "-d", blockDevice)
+				cmd.Run()
+				cmd = exec.Command("rm", "-rf", "testdata/tmp.img")
+				cmd.Run()
+			}()
+		*/
+		return newTempDiskpackedWithIndex(t, jsonconfig.Obj{
+			"type": "memory",
+		}, blockDevice)
 	}
+}
+
+func newTempDiskpackedWithIndex(t *testing.T, indexConf jsonconfig.Obj, dir string) (sto blobserver.Storage, cleanup func()) {
+	restoreLogging := test.TLog(t)
+	var removeDir string
+	if dir == "" {
+		var err error
+		dir, err = ioutil.TempDir("", "diskpacked-test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		removeDir = dir
+	} else {
+		removeDir = ""
+	}
+
 	t.Logf("diskpacked test dir is %q", dir)
 	s, err := newStorage(dir, 1<<20, indexConf)
 	if err != nil {
@@ -60,7 +113,7 @@ func newTempDiskpackedWithIndex(t *testing.T, indexConf jsonconfig.Obj) (sto blo
 		if env.IsDebug() {
 			t.Logf("CAMLI_DEBUG set, skipping cleanup of dir %q", dir)
 		} else {
-			os.RemoveAll(dir)
+			os.RemoveAll(removeDir)
 		}
 		restoreLogging()
 	}
@@ -72,6 +125,37 @@ func TestDiskpacked(t *testing.T) {
 
 func TestDiskpackedAltIndex(t *testing.T) {
 	storagetest.Test(t, newTempDiskpackedMemory)
+}
+
+func TestDiskpackedBlock(t *testing.T) {
+	storagetest.Test(t, newTempDiskpackedBlock)
+}
+
+func TestDoubleReceiveBlock(t *testing.T) {
+	sto, cleanup := newTempDiskpackedBlock(t)
+	defer cleanup()
+
+	const blobSize = 5 << 10
+	b := &test.Blob{Contents: strings.Repeat("a", blobSize)}
+	br := b.BlobRef()
+
+	_, err := blobserver.Receive(sto, br, b.Reader())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sto.(*storage).sb.Pos < blobSize {
+		t.Fatalf("size = %d; want at least %d", sto.(*storage).sb.Pos, blobSize)
+	}
+
+	Pos := sto.(*storage).sb.Pos
+	_, err = blobserver.Receive(sto, br, b.Reader())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sto.(*storage).sb.Pos > Pos {
+		t.Fatalf("size = %d; appeared to double-write. blobSize %d", sto.(*storage).sb.Pos, blobSize)
+	}
+
 }
 
 func TestDoubleReceive(t *testing.T) {
@@ -98,6 +182,7 @@ func TestDoubleReceive(t *testing.T) {
 	if size(0) < blobSize {
 		t.Fatalf("size = %d; want at least %d", size(0), blobSize)
 	}
+
 	sto.(*storage).nextPack()
 
 	_, err = blobserver.Receive(sto, br, b.Reader())
@@ -120,10 +205,21 @@ func TestDoubleReceive(t *testing.T) {
 	}
 }
 
+func TestDeleteBlock(t *testing.T) {
+	sto, cleanup := newTempDiskpackedBlock(t)
+	defer cleanup()
+
+	execDelete(t, sto)
+}
+
 func TestDelete(t *testing.T) {
 	sto, cleanup := newTempDiskpacked(t)
 	defer cleanup()
 
+	execDelete(t, sto)
+}
+
+func execDelete(t *testing.T, sto blobserver.Storage) {
 	var (
 		A = &test.Blob{Contents: "some small blob"}
 		B = &test.Blob{Contents: strings.Repeat("some middle blob", 100)}

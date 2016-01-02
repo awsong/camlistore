@@ -40,8 +40,8 @@ import (
 
 // Reindex rewrites the index files of the diskpacked .pack files
 func Reindex(root string, overwrite bool, indexConf jsonconfig.Obj) (err error) {
-	// there is newStorage, but that may open a file for writing
 	var s = &storage{root: root}
+
 	index, err := newIndex(root, indexConf)
 	if err != nil {
 		return err
@@ -57,18 +57,40 @@ func Reindex(root string, overwrite bool, indexConf jsonconfig.Obj) (err error) 
 	}()
 
 	ctx := context.TODO() // TODO(tgulacsi): get the verbosity from context
-	for i := 0; i >= 0; i++ {
-		fh, err := os.Open(s.filename(i))
+
+	fi, err := os.Stat(root)
+	if err != nil {
+		return err
+	}
+	if (fi.Mode()&os.ModeDevice) != 0 && (fi.Mode()&os.ModeCharDevice) == 0 { // block device
+		f, err := os.Open(root)
 		if err != nil {
-			if os.IsNotExist(err) {
-				break
-			}
 			return err
 		}
-		err = s.reindexOne(ctx, index, overwrite, i)
-		fh.Close()
+		s.fds = append(s.fds, f)
+		defer f.Close()
+		if err := s.readSuperBlock(); err != nil {
+			return err
+		}
+		err = s.reindexOne(ctx, index, overwrite, 0)
 		if err != nil {
 			return err
+		}
+	} else {
+		// there is newStorage, but that may open a file for writing
+		for i := 0; i >= 0; i++ {
+			fh, err := os.Open(s.filename(i))
+			if err != nil {
+				if os.IsNotExist(err) {
+					break
+				}
+				return err
+			}
+			err = s.reindexOne(ctx, index, overwrite, i)
+			fh.Close()
+			if err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -146,17 +168,23 @@ func (s *storage) Walk(ctx context.Context,
 	// TODO(tgulacsi): proper verbose flag from context
 	verbose := env.IsDebug()
 
-	for i := 0; i >= 0; i++ {
-		fh, err := os.Open(s.filename(i))
-		if err != nil {
-			if os.IsNotExist(err) {
-				break
-			}
+	if s.isRawBlkDev {
+		if err := s.walkPack(verbose, 0, walker); err != nil {
 			return err
 		}
-		fh.Close()
-		if err = s.walkPack(verbose, i, walker); err != nil {
-			return err
+	} else {
+		for i := 0; i >= 0; i++ {
+			fh, err := os.Open(s.filename(i))
+			if err != nil {
+				if os.IsNotExist(err) {
+					break
+				}
+				return err
+			}
+			fh.Close()
+			if err = s.walkPack(verbose, i, walker); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -167,18 +195,30 @@ func (s *storage) Walk(ctx context.Context,
 func (s *storage) walkPack(verbose bool, packID int,
 	walker func(packID int, ref blob.Ref, offset int64, size uint32) error) error {
 
-	fh, err := os.Open(s.filename(packID))
-	if err != nil {
-		return err
-	}
-	defer fh.Close()
-	name := fh.Name()
-
 	var (
 		pos  int64
 		size uint32
 		ref  blob.Ref
+		fh   *os.File
+		name string
+		err  error
 	)
+
+	if s.isRawBlkDev {
+		fh = s.fds[0]
+		pos = 512
+		name = s.root
+		if _, err := fh.Seek(512, os.SEEK_SET); err != nil {
+			return err
+		}
+	} else {
+		fh, err = os.Open(s.filename(packID))
+		if err != nil {
+			return err
+		}
+		defer fh.Close()
+		name = fh.Name()
+	}
 
 	errAt := func(prefix, suffix string) error {
 		if prefix != "" {
@@ -198,7 +238,11 @@ func (s *storage) walkPack(verbose bool, packID int,
 			}
 			return errAt("error while reading", err.Error())
 		} else if b != '[' {
-			return errAt(fmt.Sprintf("found byte 0x%x", b), "but '[' should be here!")
+			if s.isRawBlkDev { // Block Device, treat this as EOF
+				break
+			} else {
+				return errAt(fmt.Sprintf("found byte 0x%x(\"%s\")", b, string(b)), "but '[' should be here!")
+			}
 		}
 		chunk, err := br.ReadSlice(']')
 		if err != nil {
